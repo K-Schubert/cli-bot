@@ -1,0 +1,7 @@
+.env
+venv_cli_chat/
+*.pyc
+__pycache__/
+*.csv
+*.endpointdlp
+*.Identifier
