@@ -15,6 +15,7 @@ import base64
 import json
 import logging
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
@@ -209,7 +210,7 @@ class VLMParserClient:
         base_url: str,
         api_key: str,
         model: str,
-        timeout: float = 60.0,
+        timeout: float = 180.0,
         http_client: Optional[requests.Session] = None,
     ):
         self.base_url = base_url.rstrip("/")
@@ -430,7 +431,7 @@ class EmbeddingStore:
     """Thin wrapper around ChromaDB with CSV upsert & vector search."""
 
     def __init__(self, client: Optional[chromadb.Client] = None, collection_name: str = "docs"):
-        self.client = client or chromadb.Client()
+        self.client = client or chromadb.Client(chromadb.config.Settings(anonymized_telemetry=False))
         self.collection = self.client.get_or_create_collection(name=collection_name)
 
     @staticmethod
@@ -619,6 +620,34 @@ def extract_output_text(responses_obj: Any) -> str:
         return "\n".join(p for p in parts if p).strip()
     except Exception:
         return ""
+
+
+def _message_role(message: Message) -> Optional[Role]:
+    author = getattr(message, "author", None)
+    return getattr(author, "role", None)
+
+
+def _message_author_name(message: Message) -> Optional[str]:
+    author = getattr(message, "author", None)
+    return getattr(author, "name", None)
+
+
+def _message_content_text(message: Message) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item)
+                continue
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    return str(content) if content is not None else ""
         
 class ConversationManager:
     """
@@ -694,6 +723,11 @@ class ConversationManager:
         """
         Update rolling memory (as JSON string) and rebuild the Developer message in-place.
         """
+        if not isinstance(memory_json, str):
+            try:
+                memory_json = json.dumps(memory_json, ensure_ascii=False, indent=2)
+            except Exception:
+                memory_json = str(memory_json)
         self._memory_block = (memory_json or "").strip()
         self.developer_message = self._build_developer_content()
         # Replace the developer message at index 1
@@ -761,7 +795,7 @@ class ConversationManager:
         # Find latest assistant message (end of current turn)
         last_assistant_idx = None
         for i in range(len(self.messages) - 1, -1, -1):
-            if getattr(self.messages[i], "role", None) == Role.ASSISTANT:
+            if _message_role(self.messages[i]) == Role.ASSISTANT:
                 last_assistant_idx = i
                 break
         if last_assistant_idx is None:
@@ -770,7 +804,7 @@ class ConversationManager:
         # Find previous assistant message (end of previous turn)
         prev_assistant_idx = None
         for i in range(last_assistant_idx - 1, -1, -1):
-            if getattr(self.messages[i], "role", None) == Role.ASSISTANT:
+            if _message_role(self.messages[i]) == Role.ASSISTANT:
                 prev_assistant_idx = i
                 break
 
@@ -782,16 +816,15 @@ class ConversationManager:
         tools_out: List[Dict[str, str]] = []
 
         for m in seg:
-            role = getattr(m, "role", None)
+            role = _message_role(m)
             if role == Role.USER:
-                user_text = getattr(m, "content", "") or ""
+                user_text = _message_content_text(m)
             elif role == Role.ASSISTANT:
-                assistant_text = getattr(m, "content", "") or ""
+                assistant_text = _message_content_text(m)
             elif role == Role.TOOL:
-                author = getattr(m, "author", None)
-                author_name = getattr(author, "name", "") if author is not None else ""
+                author_name = _message_author_name(m) or ""
                 tool_name = author_name.split("functions.", 1)[-1] if "functions." in author_name else author_name
-                tools_out.append({"name": tool_name, "content": getattr(m, "content", "") or ""})
+                tools_out.append({"name": tool_name, "content": _message_content_text(m)})
 
         return {"user": user_text, "assistant": assistant_text, "tools": tools_out}
 
@@ -803,7 +836,7 @@ class ConversationManager:
         if len(self.messages) <= 2:
             return
         head = self.messages[:2]
-        tail = [m for m in self.messages[2:] if getattr(m, "role", None) != Role.TOOL]
+        tail = [m for m in self.messages[2:] if _message_role(m) != Role.TOOL]
         self.messages = head + tail
 
 
@@ -879,37 +912,53 @@ async def run_llm_round(
       - Strips visible reasoning traces (e.g., <think>...</think>) from the final answer if present.
     Returns: (final_assistant_text, prompt_token_count)
     """
+    history_logger = logging.getLogger("ConversationHistory") if debug_history else None
+
     # Up to max_tool_loops tool cycles. Each cycle: ask model -> execute tools -> append tool outputs -> repeat.
     for _ in range(max_tool_loops + 1):
         prompt = conv.render_prompt(tokenizer)
 
-        if debug_history:
-            print("\n\033[90m========== LLM PROMPT (rendered) ==========\033[0m")
-            print(prompt)
-            print("\033[90m========== END PROMPT ==========\033[0m\n")
-        
-            print("\033[90m========== HARMONY MESSAGES ==========\033[0m")
+        if history_logger:
+            history_logger.debug("========== HARMONY MESSAGES ==========")
             for i, m in enumerate(conv.messages):
-                role = getattr(m, "role", None)
-                author = getattr(m, "author", None)
-                author_name = getattr(author, "name", "") if author is not None else ""
-                content = getattr(m, "content", "")
-                print(f"\n--- [{i}] role={role} author={author_name}")
-                print(content)
-            print("\033[90m========== END HARMONY MESSAGES ==========\033[0m\n")
-        
+                role = _message_role(m)
+                history_logger.debug(
+                    "--- [%d] role=%s author=%s\n%s\n",
+                    i,
+                    getattr(role, "value", role),
+                    _message_author_name(m),
+                    getattr(m, "content", ""),
+                )
+            history_logger.debug("========== END HARMONY MESSAGES ==========")
+
         assistant = await llm.respond(prompt, temperature=temperature, tool_choice="auto")
 
         # Execute requested function calls (if any)
         executed = await tools.execute_function_calls(assistant)
         if executed:
+            if history_logger:
+                for fc in executed:
+                    args_payload = fc.get("arguments", {})
+                    try:
+                        args_repr = json.dumps(args_payload, ensure_ascii=False)
+                    except TypeError:
+                        args_repr = str(args_payload)
+                    history_logger.debug(
+                        "[tool-call] name=%s call_id=%s args=%s",
+                        fc.get("name"),
+                        fc.get("call_id"),
+                        args_repr,
+                    )
+                    history_logger.debug("[tool-call-output] %s", fc.get("output"))
             for fc in executed:
                 conv.add_tool_output(fc["name"], fc["output"])
             continue
 
         # No tool calls => finalize
-        final_text = extract_output_text(assistant)
-        final_text = strip_reasoning_traces(final_text)
+        raw_text = extract_output_text(assistant)
+        if history_logger:
+            history_logger.debug("[assistant-raw] %s", raw_text)
+        final_text = strip_reasoning_traces(raw_text)
 
         conv.add_assistant_text(final_text)
         n_tokens = conv.count_tokens(tokenizer)
@@ -920,8 +969,10 @@ async def run_llm_round(
     prompt = conv.render_prompt(tokenizer)
     assistant = await llm.respond(prompt, temperature=temperature, tool_choice="auto")
 
-    final_text = extract_output_text(assistant)
-    final_text = strip_reasoning_traces(final_text)
+    raw_text = extract_output_text(assistant)
+    if history_logger:
+        history_logger.debug("[assistant-raw] %s", raw_text)
+    final_text = strip_reasoning_traces(raw_text)
 
     conv.add_assistant_text(final_text)
     n_tokens = conv.count_tokens(tokenizer)
@@ -931,8 +982,9 @@ class MemoryCompressor:
     """
     Rolling memory compressor that:
       - Extracts doc refs + PDF uploads deterministically from tool outputs
-      - Uses an extra LLM call (no tools) to update concise key_facts/decisions/open_questions
-      - Returns a JSON string that is injected into the developer message <memory> block
+      - Tracks persistent user directives and keeps an ultra-short QA cache tied to
+        the documents used for answers
+      - Returns a JSON string injected into the developer message <memory> block
 
     IMPORTANT: Memory is internal only. Keep it short and factual.
     """
@@ -942,15 +994,15 @@ class MemoryCompressor:
         *,
         llm: LLMClient,
         max_doc_refs: int = 40,
-        max_key_facts: int = 20,
-        max_decisions: int = 15,
-        max_open_questions: int = 8,
+        max_uploaded_pdfs: int = 10,
+        max_instructions: int = 10,
+        max_qa_cache: int = 30,
     ):
         self.llm = llm
         self.max_doc_refs = max_doc_refs
-        self.max_key_facts = max_key_facts
-        self.max_decisions = max_decisions
-        self.max_open_questions = max_open_questions
+        self.max_uploaded_pdfs = max_uploaded_pdfs
+        self.max_instructions = max_instructions
+        self.max_qa_cache = max_qa_cache
 
     @staticmethod
     def _safe_json_load(s: str) -> Optional[Dict[str, Any]]:
@@ -965,7 +1017,7 @@ class MemoryCompressor:
     def _dedupe_keep_recent(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
         seen = set()
         out_rev: List[Dict[str, Any]] = []
-        for it in reversed(items):
+        for it in reversed(items or []):
             k = (it or {}).get(key)
             if not k or k in seen:
                 continue
@@ -973,7 +1025,142 @@ class MemoryCompressor:
             out_rev.append(it)
         return list(reversed(out_rev))
 
-    def _extract_sources_from_tools(self, tool_msgs: List[Dict[str, str]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    @staticmethod
+    def _dedupe_preserve_order(values: List[Any]) -> List[Any]:
+        seen = set()
+        out: List[Any] = []
+        for val in values or []:
+            if not val or val in seen:
+                continue
+            seen.add(val)
+            out.append(val)
+        return out
+
+    @staticmethod
+    def _normalize_directive(text: str) -> str:
+        return " ".join(text.strip().lower().split()) if isinstance(text, str) else ""
+
+    @staticmethod
+    def _normalize_question(text: str) -> str:
+        return " ".join((text or "").strip().lower().split())
+
+    @staticmethod
+    def _fallback_short_answer(text: str, limit: int = 160) -> str:
+        snippet = (text or "").strip().split("\n", 1)[0]
+        if len(snippet) <= limit:
+            return snippet
+        truncated = snippet[: limit - 1].rstrip()
+        return truncated + "…" if truncated else ""
+
+    def _merge_instructions(
+        self,
+        prior: List[Dict[str, Any]],
+        directives: List[str],
+        timestamp: str,
+    ) -> List[Dict[str, Any]]:
+        prior_map: Dict[str, Dict[str, Any]] = {}
+        for entry in prior or []:
+            if not isinstance(entry, dict):
+                continue
+            directive = entry.get("directive")
+            if not isinstance(directive, str):
+                continue
+            key = self._normalize_directive(directive)
+            if key:
+                prior_map[key] = deepcopy(entry)
+
+        merged: List[Dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for directive in directives or []:
+            if not isinstance(directive, str):
+                continue
+            clean = directive.strip()
+            if not clean:
+                continue
+            key = self._normalize_directive(clean)
+            entry = prior_map.get(key)
+            if entry:
+                entry["directive"] = clean
+                entry["last_seen"] = timestamp
+            else:
+                entry = {"directive": clean, "source": "user", "last_seen": timestamp}
+            merged.append(entry)
+            seen_keys.add(key)
+
+        # Preserve prior directives that remain active but were not repeated this turn
+        for entry in prior or []:
+            if not isinstance(entry, dict):
+                continue
+            directive = entry.get("directive")
+            if not isinstance(directive, str):
+                continue
+            key = self._normalize_directive(directive)
+            if key and key not in seen_keys:
+                merged.append(deepcopy(entry))
+
+        return merged[: self.max_instructions]
+
+    def _merge_qa_cache(
+        self,
+        prior: List[Dict[str, Any]],
+        new_entry: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not new_entry:
+            return [deepcopy(e) for e in (prior or [])][: self.max_qa_cache]
+
+        question_key = self._normalize_question(new_entry.get("q", ""))
+        merged: List[Dict[str, Any]] = []
+        inserted = False
+        for entry in prior or []:
+            if not isinstance(entry, dict):
+                continue
+            key = self._normalize_question(entry.get("q", ""))
+            if key and key == question_key:
+                if not inserted:
+                    merged.append(deepcopy(new_entry))
+                    inserted = True
+            else:
+                merged.append(deepcopy(entry))
+
+        if not inserted:
+            merged.insert(0, deepcopy(new_entry))
+
+        return merged[: self.max_qa_cache]
+
+    def _build_qa_entry(
+        self,
+        question: str,
+        short_answer: str,
+        doc_refs: List[Dict[str, Any]],
+        timestamp: str,
+    ) -> Optional[Dict[str, Any]]:
+        q = (question or "").strip()
+        a = (short_answer or "").strip()
+        if not q or not a:
+            return None
+
+        doc_ids = self._dedupe_preserve_order([ref.get("doc_id") for ref in doc_refs or []])
+        sources = self._dedupe_preserve_order([ref.get("source") for ref in doc_refs or []])
+        urls = self._dedupe_preserve_order([ref.get("url") for ref in doc_refs or []])
+        titles = self._dedupe_preserve_order([ref.get("title") for ref in doc_refs or []])
+
+        if not (doc_ids or sources or urls or titles):
+            return None
+
+        return {
+            "q": q,
+            "a": a,
+            "doc_ids": doc_ids,
+            "sources": sources,
+            "urls": urls,
+            "titles": titles,
+            "last_seen": timestamp,
+        }
+
+    def _extract_sources_from_tools(
+        self,
+        tool_msgs: List[Dict[str, str]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Parses tool message payloads to extract:
           - doc_refs: [{doc_id, source, title, url, tags?}, ...]
@@ -990,7 +1177,6 @@ class MemoryCompressor:
             if not isinstance(payload, dict):
                 continue
 
-            # semantic_search / metadata_search return doc_ids + doc_metadatas
             if name in {"semantic_search", "metadata_search"}:
                 ids = payload.get("doc_ids") or []
                 metas = payload.get("doc_metadatas") or []
@@ -1008,7 +1194,6 @@ class MemoryCompressor:
                             }
                         )
 
-            # pdf_upsert trace
             if name == "pdf_upsert" and payload.get("event") == "pdf_upsert":
                 uploaded_pdfs.append(
                     {
@@ -1020,78 +1205,91 @@ class MemoryCompressor:
                     }
                 )
 
-        # de-dupe doc refs by doc_id, keep most recent
         doc_refs = self._dedupe_keep_recent(doc_refs, key="doc_id")
         uploaded_pdfs = self._dedupe_keep_recent(uploaded_pdfs, key="upserted_at")
 
         return doc_refs, uploaded_pdfs
 
-    async def _llm_update_lists(
+    async def _llm_update_directives_and_summary(
         self,
         *,
-        prior_memory: Dict[str, Any],
+        prior_instructions: List[Dict[str, Any]],
         user_text: str,
         assistant_text: str,
-        doc_refs: List[Dict[str, Any]],
-        uploaded_pdfs: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """
-        Uses a tool-less LLM call to update:
-          - key_facts
-          - decisions
-          - open_questions
-        Returns dict with those keys.
-        """
-        prior_key_facts = prior_memory.get("key_facts") or []
-        prior_decisions = prior_memory.get("decisions") or []
-        prior_open = prior_memory.get("open_questions") or []
+        prior_directives = [
+            entry.get("directive")
+            for entry in prior_instructions or []
+            if isinstance(entry, dict) and isinstance(entry.get("directive"), str)
+        ]
 
-        # Keep tool outputs out of this prompt (too big). Provide doc refs metadata only.
+        user_snippet = (user_text or "")[:2000]
+        assistant_snippet = (assistant_text or "")[:2000]
+
         prompt = f"""
 Tu es un module interne de compression de mémoire pour un chatbot AVS/AI.
-Règles:
-- N'invente rien. Utilise UNIQUEMENT les informations fournies ci-dessous.
-- Pas de données personnelles.
-- Sois concis. Évite les doublons.
-- Mets à jour 3 listes: key_facts, decisions, open_questions.
+Tâches prioritaires (dans cet ordre):
+1) Maintenir et mettre à jour la liste complète des directives explicites de l'utilisateur (style, ton, langue, longueur, format, préférences). Reformule au besoin pour refléter fidèlement le désir exprimé, conserve les directives existantes encore valides et supprime celles que l'utilisateur annule clairement.
+2) Générer un résumé ultra court (max 2 phrases, <=160 caractères) de la dernière réponse assistant en ne gardant que l'information réellement nouvelle et utile pour un rappel rapide.
+3) Produire une version contextuelle (mais concise, pas un mot-clé isolé) de la question utilisateur qui tient compte de l'historique et clarifie l'intention si nécessaire.
+
+Règles strictes:
+- N'invente rien.
+- Ne copie pas la réponse complète; synthétise.
+- Les directives doivent rester alignées sur le souhait utilisateur, même s'il n'a pas répété la consigne ce tour.
+- La question contextualisée doit être courte (<=120 caractères si possible), intelligible sans jargon, et refléter la conversation (pas seulement quelques mots clés isolés).
+- Si aucune instruction nouvelle n'est donnée, renvoie les directives existantes.
+- Si la réponse ne contient rien d'utile pour un résumé, renvoie une chaîne vide.
 
 Entrées:
-1) Mémoire précédente (listes):
-- key_facts: {json.dumps(prior_key_facts, ensure_ascii=False)}
-- decisions: {json.dumps(prior_decisions, ensure_ascii=False)}
-- open_questions: {json.dumps(prior_open, ensure_ascii=False)}
-
-2) Dernier tour:
-- message utilisateur: {user_text}
-- réponse assistant: {assistant_text}
-
-3) Références docs récupérées (métadonnées uniquement, peut être vide):
-{json.dumps(doc_refs, ensure_ascii=False)}
-
-4) PDFs uploadés récemment (peut être vide):
-{json.dumps(uploaded_pdfs, ensure_ascii=False)}
+- instructions_actuelles: {json.dumps(prior_directives, ensure_ascii=False)}
+- message_utilisateur: {user_snippet}
+- reponse_assistant: {assistant_snippet}
 
 Sortie:
-Retourne UNIQUEMENT un objet JSON valide EXACTEMENT avec les clés:
-{{"key_facts": [...], "decisions": [...], "open_questions": [...]}}
+Retourne STRICTEMENT un JSON de la forme:
+{{"instructions": [...], "short_answer": "...", "question_contextualized": "..."}}
+- "instructions" : liste complète des directives actives (chaînes de caractères).
+- "short_answer" : résumé ultra court (<=160 caractères) sans retour à la ligne.
+- "question_contextualized" : reformulation brève et contextualisée de la question utilisateur.
 """.strip()
 
         resp = await self.llm.respond(prompt, temperature=0.0, tool_choice="auto")
         out = extract_output_text(resp).strip()
+        data = self._safe_json_load(out)
 
-        updated = self._safe_json_load(out)
-        if not isinstance(updated, dict):
-            # Fail-soft: keep previous lists
+        if not isinstance(data, dict):
             return {
-                "key_facts": prior_key_facts,
-                "decisions": prior_decisions,
-                "open_questions": prior_open,
+                "instructions": prior_directives,
+                "short_answer": self._fallback_short_answer(assistant_text),
+                "question_contextualized": self._fallback_short_answer(user_text or "", limit=120),
             }
 
+        raw_instructions = data.get("instructions")
+        if isinstance(raw_instructions, list):
+            directives = [str(item).strip() for item in raw_instructions if isinstance(item, (str, int, float))]
+            directives = [d for d in directives if d]
+        else:
+            directives = prior_directives
+
+        short_answer = data.get("short_answer")
+        short_answer = short_answer.strip() if isinstance(short_answer, str) else ""
+        if len(short_answer) > 160:
+            short_answer = short_answer[:159].rstrip() + "…"
+        if not short_answer:
+            short_answer = self._fallback_short_answer(assistant_text)
+
+        question_ctx = data.get("question_contextualized")
+        question_ctx = question_ctx.strip() if isinstance(question_ctx, str) else ""
+        if len(question_ctx) > 160:
+            question_ctx = question_ctx[:159].rstrip() + "…"
+        if not question_ctx:
+            question_ctx = self._fallback_short_answer(user_text or "", limit=120)
+
         return {
-            "key_facts": updated.get("key_facts", prior_key_facts),
-            "decisions": updated.get("decisions", prior_decisions),
-            "open_questions": updated.get("open_questions", prior_open),
+            "instructions": directives or prior_directives,
+            "short_answer": short_answer,
+            "question_contextualized": question_ctx,
         }
 
     async def update_memory_json(
@@ -1102,15 +1300,14 @@ Retourne UNIQUEMENT un objet JSON valide EXACTEMENT avec les clés:
         turn_assistant: str,
         turn_tools: List[Dict[str, str]],
     ) -> str:
-        """
-        Main entry: returns updated memory as JSON string.
-        """
         prior = self._safe_json_load(prior_memory_json) if prior_memory_json else None
         prior = prior if isinstance(prior, dict) else {}
 
+        prior_instructions = prior.get("instructions") if isinstance(prior.get("instructions"), list) else []
+        prior_qa_cache = prior.get("qa_cache") if isinstance(prior.get("qa_cache"), list) else []
+
         doc_refs, uploaded_pdfs = self._extract_sources_from_tools(turn_tools)
 
-        # Merge doc refs & pdf uploads with prior, keeping recent and capped
         merged_doc_refs = (prior.get("doc_refs") or []) + doc_refs
         if isinstance(merged_doc_refs, list):
             merged_doc_refs = self._dedupe_keep_recent(merged_doc_refs, key="doc_id")
@@ -1123,23 +1320,25 @@ Retourne UNIQUEMENT un objet JSON valide EXACTEMENT avec les clés:
         else:
             merged_uploaded = uploaded_pdfs
 
-        # LLM updates for key_facts/decisions/open_questions
-        lists = await self._llm_update_lists(
-            prior_memory=prior,
+        llm_updates = await self._llm_update_directives_and_summary(
+            prior_instructions=prior_instructions,
             user_text=turn_user,
             assistant_text=turn_assistant,
-            doc_refs=doc_refs[-10:],         # give only recent refs to keep prompt small
-            uploaded_pdfs=uploaded_pdfs[-5:],
         )
 
-        # Final memory object (cap sizes)
+        timestamp = datetime.utcnow().isoformat() + "Z"
+
+        instructions = self._merge_instructions(prior_instructions, llm_updates.get("instructions", []), timestamp)
+        qa_question = llm_updates.get("question_contextualized") or turn_user
+        qa_entry = self._build_qa_entry(qa_question, llm_updates.get("short_answer", ""), doc_refs, timestamp)
+        qa_cache = self._merge_qa_cache(prior_qa_cache, qa_entry)
+
         memory = {
-            "updated_at": datetime.utcnow().isoformat() + "Z",
-            "key_facts": (lists.get("key_facts") or [])[: self.max_key_facts],
-            "decisions": (lists.get("decisions") or [])[: self.max_decisions],
-            "open_questions": (lists.get("open_questions") or [])[: self.max_open_questions],
+            "updated_at": timestamp,
+            "instructions": instructions,
+            "qa_cache": qa_cache,
             "doc_refs": merged_doc_refs[-self.max_doc_refs :],
-            "uploaded_pdfs": merged_uploaded[-10:],  # small cap; adjust if needed
+            "uploaded_pdfs": merged_uploaded[-self.max_uploaded_pdfs :],
         }
 
         return json.dumps(memory, ensure_ascii=False, indent=2)
@@ -1162,6 +1361,7 @@ class RAGTool:
         self.reranker = reranker
         self.validation_mode = validation_mode
         self.verbose = verbose
+        self.logger = logging.getLogger("RAGTool")
         
         if RAGTool._bm25 is None:
             self._refresh_bm25()
@@ -1176,7 +1376,7 @@ class RAGTool:
         RAGTool._bm25_docs = docs
         RAGTool._bm25 = BM25Okapi(tokenized_docs) if tokenized_docs else None
         if self.verbose:
-            print(f"[bm25] Refreshed index with {len(tokenized_docs)} docs")
+            self.logger.debug(f"Refreshed BM25 index with {len(tokenized_docs)} docs")
 
     async def _apply_bm25(self, query: str, top_k: int = 5):
         """Return BM25 results (id, content, metadata, score)."""
@@ -1193,7 +1393,7 @@ class RAGTool:
         results.sort(key=lambda x: x["score"], reverse=True)
 
         if self.verbose:
-            print("\n>>> [BM25 results]\n", "\n".join([f'id: {r["id"]}\nurl: {r["metadata"].get("url")}\ntitle: {r["metadata"].get("title")}\nsource: {r["metadata"].get("source")}\n' for r in results[:top_k]]))
+            self.logger.debug(f"BM25 top {top_k} results for query '{query}':\n" + "\n".join([f'{{id: {r.get("id")} url: {r.get("metadata").get("url")} title: {r.get("metadata").get("title")} source: {r.get("metadata").get("source")} score: {r.get("score"):.2f}}}' for r in results[:top_k]]))
 
         return results[:top_k]
 
@@ -1202,13 +1402,13 @@ class RAGTool:
         if not (self.reranker and docs and self.validation_mode in {"rerank", "filter"}):
             return ids, docs, metas, [], []
 
-        print("\n\33[35m>>> Reranking documents")
+        self.logger.debug(f"Applying reranker to {len(docs)} docs with validation_mode={self.validation_mode}")
         scored = self.reranker.score(query, docs)
 
         if self.verbose:
             score_info = [(m.get("url") or m.get("title"), m.get("source"), s["label"], s["score"]) for m, s in zip(metas, scored)]
-            out = "\n".join(f"url:{url}\nsource:{source}\nlabel:{label}\nscore:{score:.3f}\n" for url, source, label, score in score_info)
-            print("\n>>> [Reranker Scores]\n", out)
+            out = "\n".join(f"{{url: {url} source: {source} label:{label} score:{score:.3f}}}" for url, source, label, score in score_info)
+            self.logger.debug(f"Reranker scores:\n{out}")
 
         merged = [
             {
@@ -1236,15 +1436,14 @@ class SemanticSearchTool(RAGTool):
     
     def build(self, embedder: EmbeddingClient, n_results: int = 3) -> Tool:
         async def _search(query: str, where: Optional[Dict] = None, where_document: Optional[Dict] = None):
-            print("\n\33[35m>>> Calling `semantic_search` function.")
 
             vec = await embedder.embed(query)
 
-            print(f"\n>>> [Semantic Search Query Params] {query} | {where} | {where_document}")
+            self.logger.debug(f"Semantic search with query='{query}' where={where} where_document={where_document} n_results={n_results}")
             results = self.store.query_by_embedding(vec, where=where, where_document=where_document, n_results=n_results)
 
             if self.verbose:
-                print("\n>>> [Semantic Search results]\n", "\n".join([f'***DOC {i}***\nid: {_id}\nurl: {m.get("url")}\ntitle: {m.get("title")}\nsource: {m.get("source")}\n' for i, (_id, m) in enumerate(zip(results["ids"][0], results["metadatas"][0]))]))
+                self.logger.debug(f"Semantic search results (top {n_results}):\n" + "\n".join([f'{{id: {_id} url: {m.get("url")} title: {m.get("title")} source: {m.get("source")} score: {d:.2f}}}' for _id, m, d in zip(results["ids"][0], results["metadatas"][0], results["distances"][0])]))
 
             ids = results["ids"][0]
             docs = results["documents"][0]
@@ -1298,7 +1497,9 @@ class SemanticSearchTool(RAGTool):
                         "Ex: { '$and': [ {'page': {'$gte': 5 }}, {'page': {'$lte': 10 }}, ] }"
                         "Ex: { '$and': [ {'last_modification': {'$gte': '01.01.2025' }}, {'last_modification': {'$lte': '08.09.2025' }}, ] }"
                         "Ex: { 'or': [ {'subtopics': 'avs'}, {'subtopics': 'ai'}, ] }"
-                        "Ex: { 'source': {'$in': ['ahv_iv_mementos', 'lavs', 'csc_afac']} }"
+                        "Ex: { 'source': {'$in': ['ahv_iv_mementos', 'lavs', 'csc_afac', 'rh']} }"
+                        "Ex: { 'url': {'$eq': ['https://intranet.infopers.admin.ch/infopers/fr/home/recht/datenschutz.html']} }"
+                        "Ex: { 'title': {'$eq': ['my_doc.pdf']} }"
                         "Ex: { 'tags': {'$nin': ['rente_ai', 'indépendants', 'assujetissement_avs']} }"
                     },
                     "where_document": {
@@ -1320,13 +1521,13 @@ class MetadataSearchTool(RAGTool):
     
     def build(self, limit: int = 5) -> Tool:
         async def _search(query: str, where: Optional[Dict] = None, where_document: Optional[Dict] = None):
-            print("\n\33[35m>>> Calling `metadata_search` function.")
 
-            print(f"\n>>> [Metadata Search Query Params] {where} | {where_document}")
+            self.logger.debug(f"Metadata search with query='{query}' where={where} where_document={where_document} limit={limit}")
             results = self.store.query_by_metadata(where=where, where_document=where_document, limit=limit)
 
             if self.verbose:
-                print("\n>>> [Metadata Search results]", [(_id, m.get("url") or m.get("title"), m.get("source")) for _id, m in zip(results["ids"], results["metadatas"])])
+                self.logger.debug(f"Metadata search results (limit {limit}):\n" + "\n".join([f'{{id: {_id} url: {m.get("url")} title: {m.get("title")} source: {m.get("source")} score: {d:.2f}}}' for _id, m, d in zip(results.get("ids"), results.get("metadatas"), results.get("distances"))]))
+                # print("\n>>> [Metadata Search results]", [(_id, m.get("url") or m.get("title"), m.get("source")) for _id, m in zip(results["ids"], results["metadatas"])])
 
             """ids = results.get("ids", [[]])[0]
             docs = results.get("documents", [[]])[0]
@@ -1449,12 +1650,12 @@ async def upsert_pdf_into_store(
     End-to-end: parse PDF to markdown, chunk, embed, upsert into Chroma.
     Returns a trace dict to insert into conversation history.
     """
-    print(f"\033[96m[pdf] parsing -> {pdf_path}\033[0m")
+    logger = logging.getLogger("PDFUpsert")
+    logger.debug(f"Starting PDF upsert for {pdf_path} with max_pages={max_pages}")
     md_text, total_pages = vlm.parse_pdf_to_markdown(pdf_path, max_pages=max_pages)
-    print(f"\033[96m[pdf] parsed {len(md_text)} chars from {total_pages} pages\033[0m")
 
     chunks = _chunk_markdown(md_text, max_chars=1500)
-    print(f"\033[96m[pdf] chunked into {len(chunks)} segments for embedding\033[0m")
+    logger.debug(f"Chunked markdown into {len(chunks)} segments for embedding")
 
     embeddings = await embedder.embed_batch(chunks)
 
