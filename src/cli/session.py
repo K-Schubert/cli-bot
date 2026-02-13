@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import logging
 import asyncio
-
 import traceback
 
 from utils.utils import run_llm_round
@@ -10,6 +10,7 @@ from .constants import ASSISTANT_PROMPT, INTRO_BANNER, USER_PROMPT
 from .conversation import build_conversation_manager, build_memory_compressor
 from .pdf_handler import extract_pdf_command, format_pdf_trace, process_pdf_upload
 
+logger = logging.getLogger("Session")
 
 def _print_sanity_checks(tokenizer) -> None:
     print("[sanity] /tokenize Hello world! =>", tokenizer.tokenize("Hello world!"))
@@ -82,13 +83,11 @@ async def run_session(
                     max_pages=args.pdf_max_pages,
                 )
                 conversation.add_tool_output("pdf_upsert", format_pdf_trace(trace))
-                print(
-                    f"\033[96m[upload] Upserted PDF with source: '{trace['source']}' \033[0m"
-                    f"\033[96m({trace['page_count']} pages) as {trace['chunks']} chunks at {trace['upserted_at']}\033[0m"
-                )
+                logger.info("[upload] Upserted PDF with trace: %s", trace)
+
                 user_message = question
             except Exception as exc:
-                print(f"\033[96m[upload] Failed to upsert PDF: {exc}\033[0m")
+                logger.error(f"Failed to upsert PDF: {exc}")
 
         conversation.add_user(user_message)
         conversation.truncate_to_recent_turns(args.max_conv_turns)
@@ -104,12 +103,17 @@ async def run_session(
         )
 
         print(ASSISTANT_PROMPT, reply)
-        print(f"\n\33[35m[Context Window Usage] {n_tokens}/131'000 | {n_tokens/131_000*100:.2f}%")
+        logger.info(
+            "[Context Window Usage] %d/128'000 | %.2f%%",
+            n_tokens,
+            n_tokens / 128_000 * 100,
+        )
+        print(f"\n\33[35m[Context Window Usage] {n_tokens}/128'000 | {n_tokens/128_000*100:.2f}%")
 
         try:
             await _update_memory(conversation, memory_compressor, reply)
         except Exception as exc:
-            print(f"\033[93m[memory] warning: failed to update memory ({exc})\033[0m")
+            logger.error(f"Failed to update memory: {exc}")
             traceback.print_exc()
             try:
                 conversation.strip_all_tool_traces()

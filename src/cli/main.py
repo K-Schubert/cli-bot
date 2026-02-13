@@ -21,6 +21,8 @@ def configure_logging(verbose: bool) -> None:
         logging.getLogger("RAGTool").setLevel(logging.DEBUG)
         logging.getLogger("PDFUpsert").setLevel(logging.DEBUG)
         logging.getLogger("ConversationHistory").setLevel(logging.DEBUG)
+        logging.getLogger("Session").setLevel(logging.DEBUG)
+        logging.getLogger("Services").setLevel(logging.DEBUG)
 
 
 def main(argv: Optional[list[str]] = None) -> None:

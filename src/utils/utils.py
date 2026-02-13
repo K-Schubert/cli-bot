@@ -1398,8 +1398,7 @@ class RAGTool:
         tokenized_docs = [doc.split() for doc in docs.get("documents", [])]
         RAGTool._bm25_docs = docs
         RAGTool._bm25 = BM25Okapi(tokenized_docs) if tokenized_docs else None
-        if self.verbose:
-            self.logger.debug(f"Refreshed BM25 index with {len(tokenized_docs)} docs")
+        self.logger.info(f"Refreshed BM25 index with {len(tokenized_docs)} docs")
 
     async def _apply_bm25(self, query: str, top_k: int = 5):
         """Return BM25 results (id, content, metadata, score)."""
@@ -1425,7 +1424,7 @@ class RAGTool:
         if not (self.reranker and docs and self.validation_mode in {"rerank", "filter"}):
             return ids, docs, metas, [], []
 
-        self.logger.debug(f"Applying reranker to {len(docs)} docs with validation_mode={self.validation_mode}")
+        self.logger.info(f"Applying reranker to {len(docs)} docs with validation_mode={self.validation_mode}")
         scored = self.reranker.score(query, docs)
 
         if self.verbose:
@@ -1462,7 +1461,7 @@ class SemanticSearchTool(RAGTool):
 
             vec = await embedder.embed(query)
 
-            self.logger.debug(f"Semantic search with query='{query}' where={where} where_document={where_document} n_results={n_results}")
+            self.logger.info(f"Semantic search with query='{query}' where={where} where_document={where_document} n_results={n_results}")
             results = self.store.query_by_embedding(vec, where=where, where_document=where_document, n_results=n_results)
 
             if self.verbose:
@@ -1545,12 +1544,11 @@ class MetadataSearchTool(RAGTool):
     def build(self, limit: int = 5) -> Tool:
         async def _search(query: str, where: Optional[Dict] = None, where_document: Optional[Dict] = None):
 
-            self.logger.debug(f"Metadata search with query='{query}' where={where} where_document={where_document} limit={limit}")
+            self.logger.info(f"Metadata search with query='{query}' where={where} where_document={where_document} limit={limit}")
             results = self.store.query_by_metadata(where=where, where_document=where_document, limit=limit)
 
             if self.verbose:
                 self.logger.debug(f"Metadata search results (limit {limit}):\n" + "\n".join([f'{{id: {_id} url: {m.get("url")} title: {m.get("title")} source: {m.get("source")} score: {d:.2f}}}' for _id, m, d in zip(results.get("ids"), results.get("metadatas"), results.get("distances"))]))
-                # print("\n>>> [Metadata Search results]", [(_id, m.get("url") or m.get("title"), m.get("source")) for _id, m in zip(results["ids"], results["metadatas"])])
 
             """ids = results.get("ids", [[]])[0]
             docs = results.get("documents", [[]])[0]
@@ -1570,8 +1568,6 @@ class MetadataSearchTool(RAGTool):
             
 
             ids, docs, metas, scores, labels = self._apply_reranker(query, docs, ids, metas)"""
-
-            print(query)
             
             return {
                 "doc_ids": ids,
@@ -1674,11 +1670,11 @@ async def upsert_pdf_into_store(
     Returns a trace dict to insert into conversation history.
     """
     logger = logging.getLogger("PDFUpsert")
-    logger.debug(f"Starting PDF upsert for {pdf_path} with max_pages={max_pages}")
+    logger.info(f"Starting PDF upsert for {pdf_path} with max_pages={max_pages}")
     md_text, total_pages = vlm.parse_pdf_to_markdown(pdf_path, max_pages=max_pages)
 
     chunks = _chunk_markdown(md_text, max_chars=1500)
-    logger.debug(f"Chunked markdown into {len(chunks)} segments for embedding")
+    logger.info(f"Chunked markdown into {len(chunks)} segments for embedding")
 
     embeddings = await embedder.embed_batch(chunks)
 

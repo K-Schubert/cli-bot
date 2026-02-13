@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import os
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,6 +22,7 @@ from utils.utils import (
 
 from .config import ServiceSettings
 
+logger = logging.getLogger("Services")
 
 @dataclass
 class ClientBundle:
@@ -69,16 +71,16 @@ def prepare_store(collection: str, csv_arg: Optional[str], *, verbose: bool = Fa
     match csv_arg:
         case "all":
             for path in glob.glob("/opt/app-root/src/data/*.csv"):
-                print(f"[index] Upserting CSV: {path}")
+                logger.info(f"Upserting CSV: {path}")
                 store.upsert_from_csv(path)
         case csv_path if csv_path and os.path.isfile(csv_path) and csv_path.endswith(".csv"):
-            print(f"[index] Upserting CSV: {csv_path}")
+            logger.info(f"Upserting CSV: {csv_path}")
             store.upsert_from_csv(csv_path)
         case _:
             # allow empty CSV param when relying on /pdf uploads only
             pass
 
-    print("[index] Initializing BM25 index")
+    logger.info("Initializing BM25 index")
     init_bm25(store)
 
     return store
