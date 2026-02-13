@@ -78,6 +78,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Print rendered prompt and Harmony messages sent to the LLM for each user query",
     )
+    parser.add_argument(
+        "--max-conv-turns",
+        type=int,
+        default=15,
+        help=(
+            "Maximum number of user/assistant turns to retain in active conversation history "
+            "(set to 0 to clear history each turn)."
+        ),
+    )
 
     return parser.parse_args(argv)
 

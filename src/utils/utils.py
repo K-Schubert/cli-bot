@@ -839,6 +839,29 @@ class ConversationManager:
         tail = [m for m in self.messages[2:] if _message_role(m) != Role.TOOL]
         self.messages = head + tail
 
+    def truncate_to_recent_turns(self, max_turns: Optional[int]) -> None:
+        """Keep only the most recent ``max_turns`` user/assistant turns.
+
+        Called when a new user turn begins to keep the active conversation short while
+        relying on the memory block for longer-term recall. Tool messages tied to the
+        retained turns are preserved; older turns are discarded.
+        """
+        if max_turns is None:
+            return
+        if max_turns <= 0:
+            # Preserve only system + developer messages
+            self.messages = self.messages[:2]
+            return
+
+        user_indices = [idx for idx, msg in enumerate(self.messages) if _message_role(msg) == Role.USER]
+        if len(user_indices) <= max_turns:
+            return
+
+        keep_start = user_indices[-max_turns]
+        while keep_start > 2 and _message_role(self.messages[keep_start - 1]) == Role.TOOL:
+            keep_start -= 1
+        self.messages = self.messages[:2] + self.messages[keep_start:]
+
 
 # ------------------------
 # Tool runner & inference loop

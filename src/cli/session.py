@@ -67,6 +67,7 @@ async def run_session(
             continue
 
         pdf_path, question = extract_pdf_command(raw)
+        user_message = raw
         if pdf_path:
             try:
                 trace = await process_pdf_upload(
@@ -85,12 +86,12 @@ async def run_session(
                     f"\033[96m[upload] Upserted PDF with source: '{trace['source']}' \033[0m"
                     f"\033[96m({trace['page_count']} pages) as {trace['chunks']} chunks at {trace['upserted_at']}\033[0m"
                 )
-                conversation.add_user(question)
+                user_message = question
             except Exception as exc:
                 print(f"\033[96m[upload] Failed to upsert PDF: {exc}\033[0m")
-                conversation.add_user(raw)
-        else:
-            conversation.add_user(raw)
+
+        conversation.add_user(user_message)
+        conversation.truncate_to_recent_turns(args.max_conv_turns)
 
         reply, n_tokens = await run_llm_round(
             conv=conversation,
